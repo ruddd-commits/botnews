@@ -31,7 +31,7 @@ MAX_PER_SOURCE       = 15
 FETCH_INTERVAL_MIN   = 3
 REQUEST_TIMEOUT      = 10
 DELAY_BETWEEN_SEND   = 2
-MAX_AGE_HOURS        = 3
+MAX_AGE_HOURS        = 2
 
 # ─────────────────────────────────────────────
 #  LOGGING
@@ -293,16 +293,23 @@ def format_pesan(kategori, sumber, judul, ringkasan, link, pub_time=None) -> str
     # Icon kategori
     icon = KATEGORI_ICON.get(kategori, "📰")
 
+    # Nama kategori bersih (tanpa emoji di depan)
+    nama_kategori = re.sub(r"^[\W\s]+", "", kategori).strip()
+    # Fallback: ambil kata setelah spasi pertama jika masih ada emoji
+    if not nama_kategori[0].isalpha():
+        nama_kategori = kategori.split(" ", 1)[-1].strip()
+
     # Hashtag
     hashtag = buat_hashtag(sumber, kategori)
 
     # ── Bangun pesan ────────────────────────────────────────
     baris = []
 
-    # Header kategori
-    baris.append(f"┌{'─'*30}┐")
-    baris.append(f"  {icon}  <b>{esc(kategori.split(' ', 1)[-1])}</b>")
-    baris.append(f"└{'─'*30}┘")
+    # ═══ BREAKING NEWS HEADER ═══
+    baris.append(f"🔴 <b>BREAKING NEWS</b>")
+    baris.append(f"{'━'*32}")
+    baris.append(f"{icon} <b>{esc(nama_kategori)}</b>")
+    baris.append(f"{'━'*32}")
     baris.append("")
 
     # Judul
