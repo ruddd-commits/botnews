@@ -20,7 +20,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependensi
-        run: pip install feedparser requests python-dotenv
+        run: pip install feedparser requests python-dotenv schedule
 
       - name: Restore cache artikel
         uses: actions/cache@v4
