@@ -27,11 +27,16 @@ load_dotenv()
 BOT_TOKEN            = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHANNEL_ID           = os.getenv("TELEGRAM_CHANNEL_ID", "")
 SEEN_FILE            = "seen_articles.json"
+SEEN_TITLES_FILE     = "seen_titles.json"   # ← BARU: cache judul persisten
 MAX_PER_SOURCE       = 15
 FETCH_INTERVAL_MIN   = 3
 REQUEST_TIMEOUT      = 10
 DELAY_BETWEEN_SEND   = 2
 MAX_AGE_HOURS        = 2
+
+# Threshold kemiripan judul (0.0–1.0). Semakin tinggi = lebih ketat.
+# 0.6 berarti 60% kata yang sama dianggap topik yang sama.
+TITLE_SIMILARITY_THRESHOLD = 0.6
 
 # ─────────────────────────────────────────────
 #  LOGGING
@@ -182,7 +187,7 @@ def is_recent(entry) -> bool:
 
 
 # ─────────────────────────────────────────────
-#  SEEN CACHE
+#  SEEN CACHE (URL)
 # ─────────────────────────────────────────────
 def load_seen() -> set:
     try:
@@ -199,7 +204,7 @@ def save_seen(seen: set):
         with open(SEEN_FILE, "w") as f:
             json.dump(list(seen)[-5000:], f)
     except Exception as e:
-        log.error(f"Gagal simpan cache: {e}")
+        log.error(f"Gagal simpan cache URL: {e}")
 
 
 def art_id(url: str) -> str:
@@ -207,24 +212,105 @@ def art_id(url: str) -> str:
 
 
 # ─────────────────────────────────────────────
-#  ANTI-DUPLIKAT JUDUL
+#  SEEN TITLES CACHE (PERSISTEN ANTAR SIKLUS)
 # ─────────────────────────────────────────────
+def load_seen_titles() -> dict:
+    """
+    Mengembalikan dict: { title_key (str) -> published_iso (str) }
+    title_key = token set dari judul yang dinormalisasi (disimpan sebagai string join)
+    """
+    try:
+        if os.path.exists(SEEN_TITLES_FILE):
+            with open(SEEN_TITLES_FILE, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def save_seen_titles(seen_titles: dict):
+    """Simpan max 2000 entri terbaru agar file tidak membengkak."""
+    try:
+        items = list(seen_titles.items())
+        # Trim ke 2000 entri terbaru
+        if len(items) > 2000:
+            items = items[-2000:]
+        with open(SEEN_TITLES_FILE, "w") as f:
+            json.dump(dict(items), f)
+    except Exception as e:
+        log.error(f"Gagal simpan cache judul: {e}")
+
+
+def cleanup_old_titles(seen_titles: dict) -> dict:
+    """Hapus entri judul yang sudah lebih dari MAX_AGE_HOURS * 3 jam (buffer 3x)."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=MAX_AGE_HOURS * 3)
+    cleaned = {}
+    for key, pub_iso in seen_titles.items():
+        try:
+            pub_dt = datetime.fromisoformat(pub_iso)
+            if pub_dt.tzinfo is None:
+                pub_dt = pub_dt.replace(tzinfo=timezone.utc)
+            if pub_dt >= cutoff:
+                cleaned[key] = pub_iso
+        except Exception:
+            pass  # buang entri rusak
+    return cleaned
+
+
+# ─────────────────────────────────────────────
+#  ANTI-DUPLIKAT JUDUL (LINTAS SUMBER & SIKLUS)
+# ─────────────────────────────────────────────
+STOPWORDS = {
+    "the","a","an","is","are","in","on","at","to","of","for",
+    "and","or","with","by","from","as","that","this","it","be",
+    "has","have","was","were","will","can","its","their","says",
+    "said","new","says",
+}
+
+
 def normalize_title(title: str) -> str:
+    """Normalisasi judul: lowercase, hapus karakter non-alfanumerik, hapus stopword."""
     t = title.lower()
     t = re.sub(r"[^a-z0-9\s]", "", t)
     t = re.sub(r"\s+", " ", t).strip()
-    stopwords = {
-        "the","a","an","is","are","in","on","at","to","of","for",
-        "and","or","with","by","from","as","that","this","it","be",
-        "has","have","was","were","will","can","its","their","says",
-        "said","new","says",
-    }
-    words = [w for w in t.split() if w not in stopwords]
-    return " ".join(words[:8])
+    words = [w for w in t.split() if w not in STOPWORDS]
+    return " ".join(words)
 
 
-def title_hash(title: str) -> str:
-    return hashlib.md5(normalize_title(title).encode()).hexdigest()
+def title_tokens(title: str) -> set:
+    """Kembalikan set token dari judul yang sudah dinormalisasi."""
+    return set(normalize_title(title).split())
+
+
+def jaccard_similarity(set_a: set, set_b: set) -> float:
+    """Hitung Jaccard similarity antara dua set token."""
+    if not set_a or not set_b:
+        return 0.0
+    intersection = len(set_a & set_b)
+    union = len(set_a | set_b)
+    return intersection / union if union > 0 else 0.0
+
+
+def title_key(title: str) -> str:
+    """Buat string key dari token set untuk penyimpanan di JSON."""
+    tokens = title_tokens(title)
+    return " ".join(sorted(tokens))
+
+
+def find_similar_title(new_title: str, seen_titles: dict) -> str | None:
+    """
+    Cari apakah ada judul yang mirip di seen_titles.
+    Kembalikan key yang mirip, atau None jika tidak ada.
+    """
+    new_tokens = title_tokens(new_title)
+    if not new_tokens:
+        return None
+    for existing_key in seen_titles:
+        existing_tokens = set(existing_key.split())
+        sim = jaccard_similarity(new_tokens, existing_tokens)
+        if sim >= TITLE_SIMILARITY_THRESHOLD:
+            return existing_key
+    return None
 
 
 # ─────────────────────────────────────────────
@@ -339,16 +425,18 @@ def format_pesan(kategori, sumber, judul, ringkasan, link, pub_time=None) -> str
 
 
 # ─────────────────────────────────────────────
-#  FETCH & KIRIM
+#  FETCH SEMUA ARTIKEL (TANPA KIRIM)
 # ─────────────────────────────────────────────
-def fetch_and_send():
-    log.info("=" * 50)
-    log.info(f"Mulai fetch berita (max {MAX_AGE_HOURS} jam terakhir)...")
-    seen            = load_seen()
-    seen_titles     = set()
-    total_sent      = 0
-    total_skip_old  = 0
-    total_skip_dupl = 0
+def fetch_all_candidates(seen: set) -> list[dict]:
+    """
+    Ambil semua artikel kandidat dari seluruh sumber.
+    Return list of dict:
+        { kategori, nama, judul, ringkasan, link, pub_time, aid }
+    Sudah difilter: bukan URL duplikat, masih baru (dalam MAX_AGE_HOURS),
+    dan relevan berdasarkan keyword.
+    URL duplikat langsung di-mark ke seen agar tidak muncul lagi.
+    """
+    candidates = []
 
     for kategori, feeds in SOURCES.items():
         for feed_info in feeds:
@@ -364,50 +452,163 @@ def fetch_and_send():
                     if not link or not judul:
                         continue
 
-                    # 1. Cek duplikat URL
                     aid = art_id(link)
+
+                    # Sudah pernah dikirim (URL)?
                     if aid in seen:
                         continue
 
-                    # 2. Cek umur berita
+                    # Terlalu lama?
                     pub_time = parse_published(entry)
-                    if not is_recent(entry):
-                        seen.add(aid)
-                        total_skip_old += 1
+                    if not pub_time or not is_recent(entry):
+                        seen.add(aid)  # jangan proses lagi
                         log.debug(f"Skip (terlalu lama): [{nama}] {judul[:50]}")
                         continue
 
-                    # 3. Cek duplikat judul
-                    th = title_hash(judul)
-                    if th in seen_titles:
-                        seen.add(aid)
-                        total_skip_dupl += 1
-                        log.info(f"Skip (duplikat judul): [{nama}] {judul[:60]}")
-                        continue
-                    seen_titles.add(th)
-
-                    # 4. Filter keyword relevansi
+                    # Relevan?
                     if not is_relevant(judul + " " + ringkasan):
                         seen.add(aid)
                         continue
 
-                    # 5. Kirim ke Telegram
-                    pesan = format_pesan(kategori, nama, judul, ringkasan, link, pub_time)
-                    if send_telegram(pesan):
-                        seen.add(aid)
-                        total_sent += 1
-                        log.info(f"✅ [{nama}] {judul[:60]}...")
-                        time.sleep(DELAY_BETWEEN_SEND)
+                    candidates.append({
+                        "kategori":  kategori,
+                        "nama":      nama,
+                        "judul":     judul,
+                        "ringkasan": ringkasan,
+                        "link":      link,
+                        "pub_time":  pub_time,
+                        "aid":       aid,
+                    })
 
             except Exception as e:
-                log.error(f"Error [{nama}]: {e}")
+                log.error(f"Error fetch [{nama}]: {e}")
+
+    return candidates
+
+
+# ─────────────────────────────────────────────
+#  DEDUPLIKASI KONTEN (LINTAS SUMBER)
+# ─────────────────────────────────────────────
+def deduplicate_candidates(candidates: list[dict]) -> list[dict]:
+    """
+    Dari semua kandidat artikel, hilangkan yang topiknya sama.
+    Jika ada beberapa artikel dengan judul mirip (Jaccard >= threshold),
+    HANYA artikel dengan pub_time PALING AWAL yang dipertahankan.
+    Artikel lainnya dianggap duplikat dan diabaikan.
+
+    Return: list artikel unik, diurutkan dari yang terlama ke terbaru
+            (agar yang paling awal masuk sent_titles lebih dulu).
+    """
+    # Urutkan dulu dari pub_time terlama → terbaru
+    # Dengan begitu ketika kita iterasi, artikel paling awal selalu menang
+    sorted_cands = sorted(candidates, key=lambda x: x["pub_time"])
+
+    groups: list[list[dict]] = []   # setiap group = topik yang sama
+    group_tokens: list[set]  = []   # token representatif tiap group
+
+    for art in sorted_cands:
+        tokens = title_tokens(art["judul"])
+        matched_group = None
+
+        for i, g_tokens in enumerate(group_tokens):
+            if jaccard_similarity(tokens, g_tokens) >= TITLE_SIMILARITY_THRESHOLD:
+                matched_group = i
+                break
+
+        if matched_group is not None:
+            # Masukkan ke group yang ada
+            groups[matched_group].append(art)
+        else:
+            # Buat group baru
+            groups.append([art])
+            group_tokens.append(tokens)
+
+    # Ambil hanya artikel pertama (paling awal) dari setiap group
+    unique = []
+    for group in groups:
+        winner = group[0]   # sudah sorted by pub_time, index 0 = paling lama/duluan
+        unique.append(winner)
+        if len(group) > 1:
+            dupes = [f"[{a['nama']}] {a['judul'][:50]}" for a in group[1:]]
+            log.info(
+                f"Duplikat dibuang ({len(group)-1}): pilih [{winner['nama']}] "
+                f"'{winner['judul'][:50]}' | Dibuang: {dupes}"
+            )
+
+    return unique
+
+
+# ─────────────────────────────────────────────
+#  FETCH & KIRIM
+# ─────────────────────────────────────────────
+def fetch_and_send():
+    log.info("=" * 50)
+    log.info(f"Mulai fetch berita (max {MAX_AGE_HOURS} jam terakhir)...")
+
+    seen        = load_seen()
+    seen_titles = load_seen_titles()
+
+    # Bersihkan entri judul yang sudah sangat lama
+    seen_titles = cleanup_old_titles(seen_titles)
+
+    total_sent          = 0
+    total_skip_old      = 0
+    total_skip_dupl_url = 0
+    total_skip_dupl_ttl = 0
+
+    # ── Tahap 1: Ambil semua kandidat dari semua sumber ──
+    log.info("Tahap 1: Mengumpulkan kandidat dari semua sumber...")
+    candidates = fetch_all_candidates(seen)
+    log.info(f"Total kandidat sebelum dedup: {len(candidates)}")
+
+    # ── Tahap 2: Deduplikasi antar-sumber (pilih paling duluan publish) ──
+    log.info("Tahap 2: Deduplikasi konten lintas sumber...")
+    unique_candidates = deduplicate_candidates(candidates)
+
+    # Hitung berapa yang dibuang di tahap ini
+    total_skip_dupl_ttl = len(candidates) - len(unique_candidates)
+    log.info(f"Setelah dedup konten: {len(unique_candidates)} artikel unik")
+
+    # ── Tahap 3: Filter vs seen_titles persisten & kirim ──
+    log.info("Tahap 3: Filter seen_titles persisten & kirim...")
+    for art in unique_candidates:
+        judul    = art["judul"]
+        pub_time = art["pub_time"]
+        aid      = art["aid"]
+
+        # Cek apakah sudah ada judul serupa yang pernah dikirim (lintas siklus)
+        similar_key = find_similar_title(judul, seen_titles)
+        if similar_key is not None:
+            seen.add(aid)
+            total_skip_dupl_ttl += 1
+            log.info(
+                f"Skip (duplikat persisten): [{art['nama']}] {judul[:60]}"
+            )
+            continue
+
+        # Kirim ke Telegram
+        pesan = format_pesan(
+            art["kategori"], art["nama"], judul,
+            art["ringkasan"], art["link"], pub_time
+        )
+        if send_telegram(pesan):
+            seen.add(aid)
+            # Simpan ke seen_titles persisten
+            tkey = title_key(judul)
+            pub_iso = pub_time.isoformat() if pub_time else datetime.now(timezone.utc).isoformat()
+            seen_titles[tkey] = pub_iso
+
+            total_sent += 1
+            log.info(f"✅ [{art['nama']}] {judul[:60]}...")
+            time.sleep(DELAY_BETWEEN_SEND)
 
     save_seen(seen)
+    save_seen_titles(seen_titles)
 
     log.info(
         f"Selesai — Terkirim: {total_sent} | "
         f"Skip lama: {total_skip_old} | "
-        f"Skip duplikat: {total_skip_dupl}"
+        f"Skip duplikat: {total_skip_dupl_ttl}"
     )
 
     # Laporan ringkas setiap siklus
@@ -419,7 +620,7 @@ def fetch_and_send():
             f"✅  Berita terkirim   : <b>{total_sent}</b>\n"
             f"⏱️  Filter waktu      : <b>{MAX_AGE_HOURS} jam</b> terakhir\n"
             f"🚫  Dilewati (lama)   : {total_skip_old}\n"
-            f"🔁  Dilewati (duplikat): {total_skip_dupl}\n\n"
+            f"🔁  Dilewati (duplikat): {total_skip_dupl_ttl}\n\n"
             f"{'─'*32}\n"
             f"🕐 {datetime.now().strftime('%d %b %Y  %H:%M WIB')}\n"
             f"<i>#BotUpdate #NewsBot</i>"
@@ -488,6 +689,7 @@ def main():
     print(f"  Total sumber: {TOTAL_SOURCES}")
     print(f"  Interval    : {FETCH_INTERVAL_MIN} menit")
     print(f"  Filter waktu: {MAX_AGE_HOURS} jam terakhir")
+    print(f"  Sim. threshold: {TITLE_SIMILARITY_THRESHOLD}")
     print("="*50 + "\n")
 
     send_telegram(
@@ -503,7 +705,8 @@ def main():
         f"⚙️  <b>Konfigurasi:</b>\n"
         f"  • Interval fetch  : setiap <b>{FETCH_INTERVAL_MIN} menit</b>\n"
         f"  • Filter berita   : <b>{MAX_AGE_HOURS} jam</b> terakhir\n"
-        f"  • Anti-duplikat   : URL + Judul ✅\n\n"
+        f"  • Anti-duplikat   : URL + Judul (Jaccard {TITLE_SIMILARITY_THRESHOLD}) ✅\n"
+        f"  • Cache judul     : persisten lintas siklus ✅\n\n"
         f"🕐 Aktif sejak: {datetime.now().strftime('%d %b %Y  %H:%M WIB')}\n"
         f"<i>#BotOnline #NewsBot</i>"
     )
